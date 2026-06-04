@@ -1,0 +1,1313 @@
+import numpy                as np
+from   scipy.integrate      import solve_bvp
+import matplotlib.pyplot    as plt
+import time
+from   scipy.interpolate    import interp1d
+from   scipy.integrate      import solve_ivp, quad, simpson
+import matplotlib.animation as animation
+import abc
+from scipy                  import linalg as la
+from scipy.interpolate import CubicSpline, PchipInterpolator
+import pickle
+import itertools
+
+# -----------------------------------------------------------------------------
+# This class provides routines to
+#   (i)  implement optimal control problems of the form int_0^\infty h(x) + u^\top R u dt subject to x'=f(x)+g(x)u, x(0)=x0
+#   (ii) solve the corresponding open-loop boundary value problem
+# -----------------------------------------------------------------------------
+
+
+class Model(metaclass=abc.ABCMeta):
+    def __init__(self, stateWeight, controlWeight):
+        self.stateWeight   = stateWeight    # Weight in the cost functional for the state, i.e. h(x) = stateWeight * ||x||^2
+        self.controlWeight = controlWeight  # Weight in the cost functional for the control, i.e. R = controlWeight * I
+
+    @abc.abstractmethod
+    def f(self,x): 
+        pass    
+    @abc.abstractmethod
+    def g(self,x): 
+        pass      
+    @abc.abstractmethod
+    def jacobi_of_f_transposed_dot_p(self,x,p): # Jacobian of f(x) transposed, times p
+        pass     
+
+    def solveOLBVP(self,startState,endT,numbOfEval,initSol = None): # Solve open-loop optimal control problem as a boundary value problem
+        n = startState.shape[0]
+        print(n)
+        def fun(t, y):  
+            x  = y[:n,:]
+            p  = y[n:2*n,:]
+
+            u  = self.getMuFromSr(x,p)
+            A1 = self.getF(x,u)
+            A2 =-self.jacobi_of_f_transposed_dot_p(x,p)- self.gradh(x) - self.jacobi_of_gu_transposed_dot_p(x, u, p)
+            A3 = np.atleast_2d(self.getRHS(x,u))
+            return  np.r_[A1, A2,A3]        
+        def bc(ya, yb): 
+            return  np.r_[ya[0:n]-startState,yb[n:2*n]- self.gradTerminalCost(yb[0:n]),yb[2*n]]
+        ti      = time.time()
+        tSpan   = np.linspace(0,endT ,numbOfEval) 
+        if initSol is None:
+            initSol = np.zeros((2*n+1,tSpan.size))
+
+        if self.fun_jac is None:
+           sol     = solve_bvp(fun, bc, tSpan, initSol,max_nodes=10000000, tol=1e-8)
+        else:
+           sol     = solve_bvp(fun, bc, tSpan, initSol,fun_jac=self.fun_jac, bc_jac=self.bc_jac,max_nodes=10000000, tol=1e-8)
+
+        print("Solved open-loop control with " + str(sol.x.shape[0]) + " mesh points, maximal residual error of " + str(np.amax(np.abs(sol.rms_residuals))) + ". It took "+str(time.time()-ti)+" seconds")   
+        return sol.y[0:n,:],sol.y[n:2*n,:],sol.y[-1,0] + self.terminalCost(sol.y[0:n,-1]),sol.x[:],sol.sol    
+    
+    def solveMPCBVP(self,startState,endT,deltaT,numbOfEval):
+        state,costate,vf,time,sol = self.solveOLBVP(startState,endT,numbOfEval)
+        tol                       = 10**(-4)
+        stateSample               = state[:,0]
+        costateSample             = costate[:,0]
+        vfSample                  = vf
+        while np.linalg.norm(state[:, 0])>tol:
+            state,costate,vf,time,sol = self.solveOLBVP(sol(deltaT)[:state.shape[0]],endT,numbOfEval,initSol=sol(np.linspace(deltaT,endT+deltaT,numbOfEval)))
+            stateSample               = np.c_[stateSample,state[:,0]]
+            costateSample             = np.c_[costateSample,costate[:,0]]
+            vfSample                  = np.c_[vfSample,vf]
+        return stateSample,costateSample,vfSample,time    
+
+    def solveMPCIterativ(self,startState,endT,deltaT,numbOfEval):
+        state,costate,vf,time = self.solveOLIterativ(startState,endT,numbOfEval)
+        tol                           = 10**(-4)
+        stateSample                   = state[:,0]
+        costateSample                 = costate[:,0]
+        vfSample                      = vf
+        while np.linalg.norm(state[:, 0])>tol:
+            # control                       = interp1d(time,control(np.linspace(deltaT,endT+deltaT,numbOfEval)),kind = "cubic",fill_value = "extrapolate") 
+            initSolCont                   = interp1d(time,state,kind = "cubic",fill_value = "extrapolate") 
+            state,costate,vf,time = self.solveOLIterativ(initSolCont(deltaT),endT,numbOfEval)
+            stateSample                   = np.c_[stateSample,state[:,0]]
+            costateSample                 = np.c_[costateSample,costate[:,0]]
+            vfSample                      = np.c_[vfSample,vf]
+
+        return stateSample,costateSample,vfSample,time    
+
+    def solveOLIterativ(self, startState, endT, numbOfEval, ivpSolver="BDF"):
+        """
+        Fast iterative open-loop optimal control solver with LQR/Riccati warm start.
+
+        Warm start:
+        P = self.matrixKGain  (from solve_continuous_are)
+        K = R^{-1} B^T P, with R = controlWeight * I
+        simulate closed-loop u(t) = -K x(t) on t_grid and use u_grid as initial open-loop guess.
+        """
+        startState = np.asarray(startState, dtype=float)
+
+        eps     = 1e-8
+        pres    = 1e-8
+        maxIter = 100
+
+        t_grid = np.linspace(0.0, float(endT), int(numbOfEval))
+        N = t_grid.size
+
+        # control dimension
+        m = self.B.shape[1] if hasattr(self, "B") else self.g(startState).shape[1]
+
+        def make_spline(values):
+            # values shape: (dim, N)
+            return CubicSpline(t_grid, values, axis=1, extrapolate=True)
+
+        # ---------- LQR / Riccati warm start (u_grid from closed-loop rollout)
+        u = np.zeros((m, N), dtype=float)
+
+        if hasattr(self, "matrixKGain") and hasattr(self, "B"):
+            P = np.asarray(self.matrixKGain, dtype=float)   # CARE solution (Riccati matrix)
+            B = np.asarray(self.g(startState), dtype=float)
+            R = self.controlWeight * np.eye(B.shape[1], dtype=float)
+
+            # K = R^{-1} B^T P  (shape m x n)
+            K = np.linalg.solve(R, B.T @ P)
+
+            def rhs_closed_loop(t, x):
+                u_fb = -K @ x
+                return self.f(x) + self.g(x) @ u_fb
+
+            sol0 = solve_ivp(
+                rhs_closed_loop, (0.0, endT), startState,
+                t_eval=t_grid, method=ivpSolver,
+                rtol=pres, atol=pres
+            )
+
+            x0_grid = sol0.y                      # (n, N)
+            u = -(K @ x0_grid)                    # (m, N)
+        # else: falls back to zeros (already)
+        # ---------- Forward pass with running-cost augmentation (no quad)
+        def forward(u_spline, rtol):
+            # Augment state with running cost J: dJ/dt = h(x) + w ||u||^2
+            y0 = np.concatenate([startState, [0.0]])
+
+            def rhs(t, y):
+                x = y[:-1]
+                ut = u_spline(t)  # (m,)
+                dx = self.f(x) + self.g(x) @ ut
+                dJ = float(self.h(x) + self.controlWeight * np.dot(ut, ut))
+                return np.concatenate([dx, [dJ]])
+
+            sol = solve_ivp(
+                rhs, (0.0, endT), y0,
+                method=ivpSolver,
+                t_eval=t_grid,
+                rtol=rtol, atol=rtol
+            )
+
+            x_grid = sol.y[:-1, :]     
+            J_int  = sol.y[-1, -1]
+            fe     = J_int + self.terminalCost(x_grid[:, -1])
+            return x_grid, fe
+
+        # ---------- Backward pass and gradient on the grid (no quad)
+        def backward(x_spline, u_grid, rtol):
+            pend = np.asarray(self.gradTerminalCost(x_spline(endT)), dtype=float)
+
+            def rhs(t, p):
+                x = x_spline(t)
+                return -self.jacobi_of_f_transposed_dot_p(x, p) - self.gradh(x)
+
+            sol = solve_ivp(
+                rhs, (endT, 0.0), pend,
+                method=ivpSolver,
+                t_eval=t_grid[::-1],
+                rtol=rtol, atol=rtol
+            )
+
+            p_grid = sol.y[:, ::-1]  # (n, N), flipped back to increasing time
+
+            # grad(t_k) = 2*w*u(t_k) + g(x(t_k))^T p(t_k)
+            gt_p = np.empty_like(u_grid)
+            for k in range(N):
+                xk = x_spline(t_grid[k])
+                pk = p_grid[:, k]
+                gt_p[:, k] = self.g(xk).T @ pk
+
+            grad_grid = 2.0 * self.controlWeight * u_grid + gt_p
+            dir_grid  = -grad_grid
+
+            normGrad = np.sqrt(simpson(np.sum(grad_grid * grad_grid, axis=0), t_grid))
+            return dir_grid, grad_grid, normGrad, p_grid
+
+        # ---------- main loop (BB-like step sizes as before, but discretized)
+        u_spline   = make_spline(u)
+        x_grid, fe = forward(u_spline, pres)
+        x_spline   = make_spline(x_grid)
+
+        d_old, grad_old, normGrad, p_grid = backward(x_spline, u, pres)
+        print(f"iter -2, fe = {fe}, normGrad = {normGrad}")
+
+        # first gradient step (same role as your initial -2/-1 steps)
+        u_old = u.copy()
+        u = u_old - (1.0 / max(normGrad, 1e-16)) * grad_old
+
+        u_spline = make_spline(u)
+        x_grid, fe = forward(u_spline, pres)
+        x_spline = make_spline(x_grid)
+
+        d, grad, normGrad, p_grid = backward(x_spline, u, pres)
+        print(f"iter -1, fe = {fe}, normGrad = {normGrad}")
+
+        j = 0
+        while normGrad > eps and j < maxIter:
+            # BB-like alpha with discrete integrals
+            s = (u - u_old)     # (m, N)
+            y = (d - d_old)     # (m, N)
+
+            denom = simpson(np.sum(s * y, axis=0), t_grid)
+            num   = simpson(np.sum(y * y, axis=0), t_grid)
+
+            if abs(denom) < 1e-16:
+                alpha = -max(normGrad, 1.0)
+            else:
+                alpha = num / denom
+                alpha = min(alpha, -alpha)  # keep negative like your original
+
+            u_old = u
+            d_old = d
+
+            u = u - (1.0 / alpha) * d
+
+            # tighten tolerances similar to your original scheme
+            if normGrad < 10:   pres = 1e-6
+            if normGrad < 1:    pres = 1e-6
+            if normGrad < 0.1:  pres = 1e-7
+            if normGrad < 0.01:  pres = 1e-8
+            if normGrad < 0.001: pres = 1e-9
+
+            u_spline = make_spline(u)
+            x_grid, fe = forward(u_spline, pres)
+            x_spline = make_spline(x_grid)
+
+            d, grad, normGrad, p_grid = backward(x_spline, u, pres)
+
+            print(f"iter {j}, fe = {fe}, normGrad = {normGrad}, alpha = {alpha} , HJB = {self.HJB(x_grid[:,0],p_grid[:,0])} ")
+            j += 1
+
+        # returns on the fixed grid (fast, no extra interp needed)
+        return x_grid, p_grid, fe, t_grid   
+
+    def solveSurrogate(self, startState, endT, surrogateEval):
+        # evaluate baseline once (avoid calling surrogateEval(0) repeatedly)
+        x0    = np.asarray(startState)
+        surr0 = surrogateEval(np.zeros_like(x0))
+
+        def control(x): #lambda x, z: np.sum(self.g(x) * z, axis=0, keepdims=False) 
+            return self.getMuFromSr(x, surrogateEval(x) - surr0)
+
+        def rhs(t, y_aug):
+            x = y_aug[:-1]
+            J = y_aug[-1]
+
+            u = control(x)
+            dx = self.getF(x,u)
+            dJ = self.getRHS(x,u) * (-1)
+
+            return np.concatenate([dx, [dJ]])
+
+        y0 = np.concatenate([x0, [0.0]])
+
+        sol = solve_ivp(
+            rhs, (0.0, float(endT)), y0,
+            method="BDF",
+            rtol=1e-6, atol=1e-6, 
+        )
+
+        xT   = sol.y[:-1, -1]
+        cost = sol.y[-1, -1] + self.terminalCost(xT)
+
+        return sol.y[:-1], sol.t, cost
+
+
+    def solveSurrogateControl(self, startState, endT, surrogateEvalControl):
+        """
+        Solve the closed-loop system using a surrogate that directly approximates
+        the feedback control u(x).
+
+        surrogateEvalControl(x) must return u(x), not grad V(x).
+        """
+
+        x0 = np.asarray(startState, dtype=float).reshape(-1)
+
+        def control(x):
+            u = surrogateEvalControl(x)
+            u = np.asarray(u, dtype=float)
+
+            # Make scalar / vector outputs robust
+            if u.ndim == 0:
+                return np.array([float(u)])
+
+            if u.ndim == 1:
+                return u
+
+            if u.ndim == 2:
+                if u.shape[1] == 1:
+                    return u[:, 0]
+                if u.shape[0] == 1:
+                    return u[0, :]
+
+            raise ValueError(f"surrogateEvalControl returned invalid shape {u.shape}")
+
+        def rhs(t, y_aug):
+            x = y_aug[:-1]
+
+            u = control(x)
+
+            dx = self.getF(x, u)
+            dx = np.asarray(dx, dtype=float).reshape(-1)
+
+            # In your code getRHS is negative running cost:
+            # getRHS = -h(x) - u^T R u
+            # therefore accumulated cost uses -getRHS.
+            dJ = -float(np.asarray(self.getRHS(x, u)).reshape(-1)[0])
+
+            return np.concatenate([dx, [dJ]])
+
+        y0 = np.concatenate([x0, [0.0]])
+
+        sol = solve_ivp(
+            rhs,
+            (0.0, float(endT)),
+            y0,
+            method="BDF",
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+        xT = sol.y[:-1, -1]
+        cost = sol.y[-1, -1] + self.terminalCost(xT)
+
+        return sol.y[:-1], sol.t, cost
+   
+
+
+class HEDirichletFD(Model):
+    def __init__(self, NumbNodes, para):
+        self.NumbNodes     = NumbNodes
+        self.alpha         = para[0]
+        self.beta          = para[1]
+        self.stateWeight   = para[2]
+        self.controlWeight = para[3]
+        self.controlDim    = 4
+
+        self.makeFDSystem(NumbNodes)
+        self.stateWeight = self.stateWeight * self.dx
+        print(self.dx)
+
+        if self.stateWeight < 0:
+            raise ValueError("stateWeight must be nonnegative.")
+
+        if self.controlWeight <= 0:
+            raise ValueError("controlWeight must be positive.")
+
+        Q = self.stateWeight   * np.eye(self.A.shape[0])
+        R = self.controlWeight * np.eye(self.B.shape[1])
+
+        self.matrixKGain = la.solve_continuous_are(
+            self.alpha * self.A,
+            self.B,
+            Q,
+            R,
+            e=None,
+            s=None,
+            balanced=True
+        )
+
+        self.matrixKGain = 0.5 * (self.matrixKGain + self.matrixKGain.T)
+
+        eigs = np.linalg.eigvalsh(self.matrixKGain)
+        self.lambdaMin = eigs[0]
+        self.lambdaMax = eigs[-1]
+
+        self.fun_jac = self.jacobi_of_f
+
+        self.getMuFromSr = lambda x, srX: (
+            -0.5 / self.controlWeight * (self.B.T @ srX)
+        )
+
+        self.getF = lambda x, muX: self.f(x) + self.B @ muX
+
+        self.getRHS = lambda x, muX: (
+            -self.stateWeight   * np.sum(x**2, axis=0)
+            -self.controlWeight * np.sum(muX**2, axis=0)
+        )
+
+        self.HJB = lambda x, p: (
+            self.stateWeight   * np.sum(x**2, axis=0)
+            - 0.25 * np.sum((self.B.T @ p)**2, axis=0) / self.controlWeight
+            + np.sum(self.f(x) * p, axis=0)
+        )
+
+        P0 =  np.eye(self.A.shape[0]) * (self.lambdaMin + self.lambdaMax) / 2
+
+        self.V0 = lambda x: np.sum(x * (P0 @ x), axis=0)
+        self.gradV_0 = lambda x: 2 * (P0 @ x)
+
+        self.stableControl = lambda x: self.getMuFromSr(
+            x,
+            self.gradV_0(x)
+        )
+
+    def h(self, x):
+        return self.stateWeight   * np.sum(x**2, axis=0)
+
+    def gradh(self, x):
+        return 2 * self.stateWeight   * x
+
+    def terminalCost(self, x):
+        return np.sum(x * (self.matrixKGain @ x), axis=0)
+
+    def gradTerminalCost(self, x):
+        return 2 * self.matrixKGain @ x
+
+    def f(self, x):
+        return self.alpha * (self.A @ x) + self.beta * (x**2 - x**3)
+
+    def g(self, x):
+        return self.B
+
+    def jacobi_of_f(self, x):
+        x = np.asarray(x)
+
+        if x.ndim != 1:
+            raise ValueError("jacobi_of_f expects x to have shape (N,).")
+
+        return self.alpha * self.A + self.beta * np.diag(2*x - 3*x**2)
+
+    def jacobi_of_f_transposed_dot_p(self, x, p):
+        return (
+            self.alpha * self.A.T @ p
+            + 2 * self.beta * (p * x)
+            - 3 * self.beta * (p * x**2)
+        )
+
+    def jacobi_of_gu_transposed_dot_p(self, x, u, p):
+        return np.zeros_like(x)
+
+    def makeFDSystem(self, NumbNodes):
+        dx = 1.0 / (NumbNodes + 1)
+        center = np.linspace(dx, 1.0 - dx, NumbNodes)
+
+        main_diag = -2.0 * np.ones(NumbNodes) / dx**2
+        off_diag  =  1.0 * np.ones(NumbNodes - 1) / dx**2
+
+        self.A = (
+            np.diag(main_diag)
+            + np.diag(off_diag, k=1)
+            + np.diag(off_diag, k=-1)
+        )
+
+        self.B = np.zeros((NumbNodes, 4))
+
+        tol = 1e-12
+
+        self.B[(center >= 0.1 - tol) & (center <= 0.2 + tol), 0] = 1.0
+        self.B[(center >= 0.3 - tol) & (center <= 0.4 + tol), 1] = 1.0
+        self.B[(center >= 0.6 - tol) & (center <= 0.7 + tol), 2] = 1.0
+        self.B[(center >= 0.8 - tol) & (center <= 0.9 + tol), 3] = 1.0
+
+        self.dx = dx
+        self.center = center
+
+        if np.any(np.linalg.norm(self.B, axis=0) == 0):
+            raise ValueError(
+                "At least one control region contains no grid points. "
+                "Increase NumbNodes or change the actuator intervals."
+            )
+
+    def plotSolution(self, solY):
+        """
+        Efficient animation of the finite-difference solution.
+        """
+        dx = 1.0 / (self.NumbNodes + 1)
+        center = np.linspace(dx, 1.0 - dx, self.NumbNodes)
+
+        x_plot = np.concatenate(([0.0], center, [1.0]))
+        y0 = np.concatenate(([0.0], solY[:, 0], [0.0]))
+
+        fig, ax = plt.subplots()
+
+        line, = ax.plot(x_plot, y0)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(-1.0, 1.0)
+
+        def update_currentPlot(num):
+            y_plot = np.concatenate(([0.0], solY[:, num], [0.0]))
+            line.set_ydata(y_plot)
+            ax.set_title(f"Time step {num}")
+            return line,
+
+        line_ani = animation.FuncAnimation(
+            fig,
+            update_currentPlot,
+            frames=solY.shape[1],
+            interval=1,
+            repeat=False
+        )
+
+        plt.show()
+        return line_ani
+    
+    def makeInitialStatesFromLaplacianModes(
+        self,
+        numModes,
+        coefficientGrids):
+        """
+        Generate initial states from low Dirichlet-Laplacian modes.
+
+        x0 = sum_{k=1}^{numModes} a_k sqrt(2) sin(k pi x)
+
+        Parameters
+        ----------
+        numModes : int
+            Number of low Laplacian modes.
+        coefficientGrids : list of 1D arrays
+            Grid values for each modal coefficient.
+        thetaMin, thetaMax : float or None
+            Optional pointwise bounds for filtering physical states.
+
+        Returns
+        -------
+        X0 : ndarray, shape (NumbNodes, numStates)
+            Initial states as columns.
+        A0 : ndarray, shape (numModes, numStates)
+            Corresponding modal coefficients as columns.
+        Phi : ndarray, shape (NumbNodes, numModes)
+            Discrete Laplacian modes.
+        """
+
+        dx = 1.0 / (self.NumbNodes + 1)
+        x = np.linspace(dx, 1.0 - dx, self.NumbNodes)
+
+        k = np.arange(1, numModes + 1)
+
+        Phi = np.sqrt(2.0) * np.sin(np.pi * np.outer(x, k))
+
+        coeffList = list(itertools.product(*coefficientGrids))
+        A0 = np.array(coeffList).T
+
+        X0 = Phi @ A0
+
+        mask = np.ones(X0.shape[1], dtype=bool)
+
+
+
+        X0 = X0[:, mask]
+        A0 = A0[:, mask]
+
+        return X0, A0, Phi  
+
+
+
+class HEDirichletROM(Model):
+    def __init__(self, NumbNodes, para, PhiPOD):
+        self.NumbNodes     = NumbNodes
+        self.alpha         = para[0]
+        self.beta          = para[1]
+        self.stateWeight   = para[2]
+        self.controlWeight = para[3]
+        self.controlDim    = 4
+
+        self.makeFDSystem(NumbNodes)
+
+        # scale state cost with dx, if you want L2-type PDE cost
+        self.stateWeight = self.stateWeight * self.dx
+
+        self.Phi = np.asarray(PhiPOD)
+        self.r = self.Phi.shape[1]
+
+        # Gram matrix, useful even if Phi is only approximately orthonormal
+        self.Gram = self.Phi.T @ self.Phi
+        self.GramInv = la.inv(self.Gram)
+
+        # Reduced operators
+        self.A_full = self.A
+        self.B_full = self.B
+
+        self.A = self.GramInv @ self.Phi.T @ self.A_full @ self.Phi
+        self.B = self.GramInv @ self.Phi.T @ self.B_full
+
+        # Reduced state cost matrix
+        self.Q = self.stateWeight * self.Gram
+        self.R = self.controlWeight * np.eye(self.controlDim)
+
+        self.matrixKGain = la.solve_continuous_are(
+            self.alpha * self.A,
+            self.B,
+            self.Q,
+            self.R,
+            e=None,
+            s=None,
+            balanced=True
+        )
+
+
+
+        self.fun_jac = self.jacobi_of_f
+
+        self.getMuFromSr = lambda z, srZ: (
+            -0.5 / self.controlWeight * (self.B.T @ srZ)
+        )
+
+        self.getF = lambda z, muZ: self.f(z) + self.B @ muZ
+
+        self.getRHS = lambda z, muZ: (
+            -self.h(z)
+            -self.controlWeight * np.sum(muZ**2, axis=0)
+        )
+
+        self.HJB = lambda z, p: (
+            self.h(z)
+            - 0.25 * np.sum((self.B.T @ p)**2, axis=0) / self.controlWeight
+            + np.sum(self.f(z) * p, axis=0)
+        )
+
+        self.matrixKGain = 0.5 * (self.matrixKGain + self.matrixKGain.T)
+
+        eigs = np.linalg.eigvalsh(self.matrixKGain)
+        self.lambdaMin = eigs[0]
+        self.lambdaMax = eigs[-1]
+
+        P0 = np.eye(self.r) * self.lambdaMin 
+
+        self.V0 = lambda z: np.sum(z * (P0 @ z), axis=0)
+        self.gradV_0 = lambda z: 2 * (P0 @ z)
+
+        self.stableControl = lambda z: self.getMuFromSr(
+            z,
+            self.gradV_0(z)
+        )
+
+    def lift(self, z):
+        """
+        Reduced coordinates z -> full FD state x.
+        """
+        return self.Phi @ z
+
+    def project(self, x):
+        """
+        Full FD state x -> reduced coordinates z.
+        """
+        return self.GramInv @ self.Phi.T @ x
+
+    def h(self, z):
+        return np.sum(z * (self.Q @ z), axis=0)
+
+    def gradh(self, z):
+        return 2 * (self.Q @ z)
+
+    def terminalCost(self, z):
+        return np.sum(z * (self.matrixKGain @ z), axis=0)
+
+    def gradTerminalCost(self, z):
+        return 2 * self.matrixKGain @ z
+
+    def f(self, z):
+        """
+        Reduced dynamics:
+
+            zdot = alpha A_r z + beta Phi^T (x^2 - x^3)
+
+        with x = Phi z.
+        """
+        x = self.lift(z)
+        reaction = x**2 - x**3
+
+        return (
+            self.alpha * (self.A @ z)
+            + self.beta * self.project(reaction)
+        )
+
+    def g(self, z):
+        z = np.asarray(z)
+
+        if z.ndim == 1:
+            N = 1
+        else:
+            N = z.shape[1]
+
+        return np.broadcast_to(self.B[:, :, None], (self.r, self.controlDim, N))
+
+    def jacobi_of_f(self, z):
+        z = np.asarray(z)
+
+        if z.ndim != 1:
+            raise ValueError("jacobi_of_f expects z to have shape (r,).")
+
+        x = self.lift(z)
+
+        diag_reaction = 2 * x - 3 * x**2
+
+        J_reaction = (
+            self.GramInv
+            @ self.Phi.T
+            @ (diag_reaction[:, None] * self.Phi)
+        )
+
+        return self.alpha * self.A + self.beta * J_reaction
+
+    def jacobi_of_f_transposed_dot_p(self, z, p):
+        return self.jacobi_of_f(z).T @ p
+
+    def jacobi_of_gu_transposed_dot_p(self, z, u, p):
+        return np.zeros_like(z)
+
+    def makeFDSystem(self, NumbNodes):
+        dx = 1.0 / (NumbNodes + 1)
+        center = np.linspace(dx, 1.0 - dx, NumbNodes)
+
+        main_diag = -2.0 * np.ones(NumbNodes) / dx**2
+        off_diag  =  1.0 * np.ones(NumbNodes - 1) / dx**2
+
+        self.A = (
+            np.diag(main_diag)
+            + np.diag(off_diag, k=1)
+            + np.diag(off_diag, k=-1)
+        )
+
+        self.B = np.zeros((NumbNodes, 4))
+
+        tol = 1e-12
+
+        self.B[(center >= 0.1 - tol) & (center <= 0.2 + tol), 0] = 1.0
+        self.B[(center >= 0.3 - tol) & (center <= 0.4 + tol), 1] = 1.0
+        self.B[(center >= 0.6 - tol) & (center <= 0.7 + tol), 2] = 1.0
+        self.B[(center >= 0.8 - tol) & (center <= 0.9 + tol), 3] = 1.0
+
+        self.dx = dx
+        self.center = center
+
+        if np.any(np.linalg.norm(self.B, axis=0) == 0):
+            raise ValueError(
+                "At least one control region contains no grid points. "
+                "Increase NumbNodes or change the actuator intervals."
+            )
+        
+
+class VanDerPol(Model): # Van der Pol oscillator
+    def __init__(self,stateWeight,controlWeight):
+        self.stateWeight   = stateWeight
+        self.controlWeight = controlWeight
+        A = np.array([[0.0, 1.0],
+              [-1.0, 1.0]])
+        self.matrixKGain   = la.solve_continuous_are(A,np.atleast_2d(np.array([0,1])).T,stateWeight* np.eye(2), controlWeight, e=None, s=None, balanced=True)
+        self.lambdaMin     = np.linalg.eigvals(self.matrixKGain).min().real
+        self.lambdaMax     = np.linalg.eigvals(self.matrixKGain).max().real
+        self.stableControl = lambda x: np.atleast_2d(-(1/self.controlWeight) * np.sum(self.g(x) * (self.matrixKGain  @ x),0)) 
+        self.getMuFromSr   = lambda x,srX: (-0.5/self.controlWeight)* (self.g(x).T @ srX) 
+        self.getF          = lambda x,muX: self.f(x)+self.g(x)@muX
+        self.getRHS        = lambda x,muX: -self.stateWeight * np.sum(x**2,0) -self.controlWeight * np.sum(muX**2,0) 
+        self.controlDim    = 1
+        self.HJB           = lambda x,muX: self.stateWeight * np.sum(x**2,0) -1/4 * (self.g(x).T @ muX)**2 / self.controlWeight + (self.f(x).T @ muX)
+         
+    def h(self,x):                return self.stateWeight * np.sum(x**2,0)
+    def gradh(self,x):            return 2 * self.stateWeight * (x)
+    def terminalCost(self,x):     return x.T @ self.matrixKGain @ x
+    def gradTerminalCost(self,x): return 2 * self.matrixKGain @ x        
+
+    def f(self,x):                              return np.array([x[1],-x[0]+x[1]*(1-x[0]**2)])
+    def g(self,x):                              return np.array([[0,1]]).T
+    def jacobi_of_f_transposed_dot_p(self,x,p): return np.array([-p[1]-2*p[1]*x[0]*x[1],p[0]+p[1]*(1-x[0]**2)]) 
+    def jacobi_of_gu_transposed_dot_p(self, x, u, p):
+        # default: g does not depend on x  -> D_x(g u)=0
+        return 0.0 * p
+    def fun_jac(self,t, y):
+        # y has shape (5, m): [x1, x2, p1, p2, v]
+        x1 = y[0, :]
+        x2 = y[1, :]
+        p2 = y[3, :]
+
+        Q = self.stateWeight
+        R = self.controlWeight
+        m = t.size
+
+        J = np.zeros((5, 5, m))
+
+        # x1' = x2
+        J[0, 1, :] = 1.0
+
+        # x2' = -x1 + x2*(1-x1^2) + u,  u = -(1/(2R))*p2
+        J[1, 0, :] = -1.0 - 2.0 * x1 * x2
+        J[1, 1, :] =  1.0 - x1**2
+        J[1, 3, :] = -1.0 / (2.0 * R)
+
+        # p1' = (1 + 2 x1 x2)*p2 - 2Q*x1
+        J[2, 0, :] =  2.0 * x2 * p2 - 2.0 * Q
+        J[2, 1, :] =  2.0 * x1 * p2
+        J[2, 3, :] =  1.0 + 2.0 * x1 * x2
+
+        # p2' = -p1 - (1-x1^2)*p2 - 2Q*x2
+        J[3, 0, :] =  2.0 * x1 * p2
+        J[3, 1, :] = -2.0 * Q
+        J[3, 2, :] = -1.0
+        J[3, 3, :] = -1.0 + x1**2
+
+        # v' = -Q(x1^2+x2^2) - p2^2/(4R)
+        J[4, 0, :] = -2.0 * Q * x1
+        J[4, 1, :] = -2.0 * Q * x2
+        J[4, 3, :] = -p2 / (2.0 * R)
+
+        return J
+    def bc_jac(self,ya, yb):
+        # bc = [ ya[0:2]-x0 , yb[2:4]-2K*yb[0:2] , yb[4] ]
+        K = self.matrixKGain
+
+        dbc_dya = np.zeros((5, 5))
+        dbc_dyb = np.zeros((5, 5))
+
+        # initial state constraints
+        dbc_dya[0, 0] = 1.0
+        dbc_dya[1, 1] = 1.0
+
+        # terminal costate constraints: p(T) - 2K x(T) = 0
+        dbc_dyb[2, 0:2] = -2.0 * K[0, :]
+        dbc_dyb[3, 0:2] = -2.0 * K[1, :]
+        dbc_dyb[2, 2] = 1.0
+        dbc_dyb[3, 3] = 1.0
+
+        # terminal v(T) = 0
+        dbc_dyb[4, 4] = 1.0
+
+        return dbc_dya, dbc_dyb
+
+
+class AcademicToyModel(Model):
+    """
+    h(x) = alpha * ||x||^2
+    R    = beta  * I_N
+
+    f(x) = (1/4) exp(-||x||^2) x
+    g(x) =        exp(-||x||^2) I_N
+    """
+
+    def __init__(self, N: int, alpha: float, beta: float):
+        self.N = int(N)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.controlWeight = float(beta)
+
+        self.stateDim   = self.N
+        self.controlDim = self.N
+
+        if self.beta <= 0:
+            raise ValueError("beta must be > 0 (R = beta I).")
+
+        # s(x) := exp(-||x||^2)
+        self._s = lambda x: np.exp(-np.sum(np.asarray(x) ** 2, axis=0))
+
+        # LQR terminal matrix from linearization at 0:
+        # x' = A x + B u  with A=(1/4)I, B=I
+        # cost ∫ (x^T Q x + u^T R u) dt with Q=alpha I, R=beta I
+        A = 0.25 * np.eye(self.N)
+        B = np.eye(self.N)
+        Q = self.alpha * np.eye(self.N)
+        R = self.beta * np.eye(self.N)
+        self.matrixKGain = la.solve_continuous_are(A, B, Q, R, balanced=True)
+        self.trueVF        = lambda x: np.exp(np.sum(x**2,0))-1
+
+        eigs           = np.linalg.eigvals(self.matrixKGain).real
+        self.lambdaMin = eigs.min()
+        self.lambdaMax = eigs.max()
+
+        # Stabilizing feedback (for initial guesses etc.)
+        # u ≈ -R^{-1} B^T K x = -(1/beta) K x, and include nonlinear gain s(x)
+        self.stableControl = lambda x: -(self._s(x) / self.beta) * (self.matrixKGain @ x)
+
+        # PMP optimal control: u*(x,p) = -(1/2) R^{-1} g(x)^T p
+        # here g^T p = s(x) p, R^{-1}=(1/beta)I  => u* = -(s/(2beta)) p
+        self.getMuFromSr = lambda x, p: -(self._s(x) / (2.0 * self.beta)) * p
+
+        # Closed-loop drift
+        self.getF = lambda x, u: self.f(x) + self._s(x) * u
+
+        # Your sign convention: RHS = -running_cost
+        self.getRHS = lambda x, u: -self.alpha * np.sum(x**2, axis=0) - self.beta * np.sum(u**2, axis=0)
+
+        # H*(x,p) = h(x) - 1/4 p^T g R^{-1} g^T p + f(x)^T p
+        # g R^{-1} g^T = (s^2/beta) I
+        self.HJB = lambda x, p: (
+            self.alpha * np.sum(x**2, axis=0)
+            - (self._s(x) ** 2) * np.sum(p**2, axis=0) / (4.0 * self.beta)
+            + np.sum(self.f(x) * p, axis=0)
+        )
+
+        self.fun_jac = None
+        self.bc_jac  = None
+
+
+    # --- Costs ---
+    def h(self, x):
+        return self.alpha * np.sum(x**2, axis=0)
+
+    def gradh(self, x):
+        return 2.0 * self.alpha * x
+
+    def terminalCost(self, x):
+        x = np.asarray(x)
+        if x.ndim == 1:
+            return float(x.T @ self.matrixKGain @ x)
+        return np.sum(x * (self.matrixKGain @ x), axis=0)
+
+    def gradTerminalCost(self, x):
+        return 2.0 * (self.matrixKGain @ x)
+
+    # --- Dynamics ---
+    def f(self, x):
+        return 0.25 * self._s(x) * x
+
+    def g(self, x):
+        x = np.asarray(x, dtype=float)
+
+        # Single state: x.shape == (N,)
+        # Return shape (N, N)
+        if x.ndim == 1:
+            return self._s(x) * np.eye(self.N)
+
+        # Batched states: x.shape == (N, M)
+        # Return shape (N, N, M)
+        if x.ndim == 2:
+            s = self._s(x)  # shape (M,)
+            return np.eye(self.N)[:, :, None] * s[None, None, :]
+
+        raise ValueError("g(x) expects shape (N,) or batched shape (N,M).")
+
+    def jacobi_of_f_transposed_dot_p(self, x, p):
+        """
+        (Df(x))^T p, with f(x) = (1/4) s x, s=exp(-||x||^2).
+        Df = (s/4)I - (s/2) x x^T (symmetric)
+        """
+        x = np.asarray(x)
+        p = np.asarray(p)
+        s = self._s(x)
+        alpha_xp = np.sum(x * p, axis=0)
+        return (s / 4.0) * p - (s / 2.0) * x * alpha_xp
+    def jacobi_of_gu_transposed_dot_p(self, x, u, p):
+        # returns (D_x(g(x)u))^T p
+        s = self._s(x)                         # shape (m,)
+        utp = np.sum(u * p, axis=0)            # shape (m,)
+        return -2.0 * s * x * utp              # shape (N,m)
+
+
+class CoupledDuffingOscillator4D(Model):
+    """
+    Four-dimensional controlled coupled Duffing oscillator.
+
+    State:
+        x = (q1, q2, v1, v2)
+
+    Control:
+        u = (u1, u2)
+
+    Dynamics:
+        qdot = v
+        vdot = -D v - grad U(q) + u
+
+    Running cost:
+        h(x) = U(q) + 0.5 * |v|^2
+
+    Control cost:
+        u^T R u = controlWeight * |u|^2
+    """
+
+    def __init__(
+        self,
+        k1=1.0,
+        k2=1.4,
+        kc=0.35,
+        d1=0.15,
+        d2=0.25,
+        lam=0.20,
+        lamc=0.05,
+        controlWeight=0.05,
+    ):
+        self.k1 = float(k1)
+        self.k2 = float(k2)
+        self.kc = float(kc)
+
+        self.d1 = float(d1)
+        self.d2 = float(d2)
+
+        self.lam = float(lam)
+        self.lamc = float(lamc)
+
+        self.stateDim = 4
+        self.controlDim = 2
+
+        self.stateWeight = 1.0
+        self.controlWeight = float(controlWeight)
+
+        if self.controlWeight <= 0:
+            raise ValueError("controlWeight must be positive.")
+
+        self.D = np.diag([self.d1, self.d2])
+
+        self.K0 = np.array([
+            [self.k1 + self.kc, -self.kc],
+            [-self.kc, self.k2 + self.kc],
+        ])
+
+        self.B = np.array([
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ])
+
+        self.A = np.block([
+            [np.zeros((2, 2)), np.eye(2)],
+            [-self.K0, -self.D],
+        ])
+
+        # h(x) = 0.5 * x^T H x + higher order terms near the origin.
+        # Thus Q = 0.5 * D^2 h(0) = 0.5 * H.
+        H = np.block([
+            [self.K0, np.zeros((2, 2))],
+            [np.zeros((2, 2)), np.eye(2)],
+        ])
+        self.Q = 0.5 * H
+
+        R = self.controlWeight * np.eye(self.controlDim)
+
+        self.matrixKGain = la.solve_continuous_are(
+            self.A,
+            self.B,
+            self.Q,
+            R,
+        )
+
+        self.fun_jac = None
+        self.bc_jac = None
+
+    def _as2d(self, x):
+        x = np.asarray(x, dtype=float)
+        vector_input = False
+
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+            vector_input = True
+
+        if x.shape[0] != 4:
+            raise ValueError(f"Expected state dimension 4, got shape {x.shape}.")
+
+        return x, vector_input
+
+    def _potential(self, q):
+        q1 = q[0]
+        q2 = q[1]
+        z = q1 - q2
+
+        return (
+            0.5 * self.k1 * q1**2
+            + 0.5 * self.k2 * q2**2
+            + 0.5 * self.kc * z**2
+            + 0.25 * self.lam * (q1**4 + q2**4)
+            + 0.25 * self.lamc * z**4
+        )
+
+    def _grad_potential(self, q):
+        q1 = q[0]
+        q2 = q[1]
+        z = q1 - q2
+
+        dU_q1 = (
+            self.k1 * q1
+            + self.kc * z
+            + self.lam * q1**3
+            + self.lamc * z**3
+        )
+
+        dU_q2 = (
+            self.k2 * q2
+            - self.kc * z
+            + self.lam * q2**3
+            - self.lamc * z**3
+        )
+
+        return np.vstack([dU_q1, dU_q2])
+
+    def _hessian_potential_entries(self, q):
+        q1 = q[0]
+        q2 = q[1]
+        z = q1 - q2
+
+        common = 3.0 * self.lamc * z**2
+
+        H11 = self.k1 + self.kc + 3.0 * self.lam * q1**2 + common
+        H22 = self.k2 + self.kc + 3.0 * self.lam * q2**2 + common
+        H12 = -self.kc - common
+
+        return H11, H12, H22
+
+    def f(self, x):
+        x, vector_input = self._as2d(x)
+
+        q = x[:2, :]
+        v = x[2:, :]
+
+        gradU = self._grad_potential(q)
+
+        out = np.vstack([
+            v,
+            -self.D @ v - gradU,
+        ])
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def g(self, x):
+        x = np.asarray(x, dtype=float)
+
+        if x.ndim == 1:
+            return self.B
+
+        if x.ndim == 2:
+            return np.broadcast_to(
+                self.B[:, :, None],
+                (self.stateDim, self.controlDim, x.shape[1]),
+            )
+
+        raise ValueError(f"g(x) expects shape (4,) or (4,M), got {x.shape}.")
+
+    def h(self, x):
+        x, vector_input = self._as2d(x)
+
+        q = x[:2, :]
+        v = x[2:, :]
+
+        val = self._potential(q) + 0.5 * np.sum(v * v, axis=0)
+
+        if vector_input:
+            return float(val[0])
+
+        return val
+
+    def gradh(self, x):
+        x, vector_input = self._as2d(x)
+
+        q = x[:2, :]
+        v = x[2:, :]
+
+        out = np.vstack([
+            self._grad_potential(q),
+            v,
+        ])
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def getMuFromSr(self, x, p):
+        """
+        u = -1/(2R) * g(x)^T p.
+
+        Here R = controlWeight * I and g^T p = (p_v1, p_v2).
+        """
+        p = np.asarray(p, dtype=float)
+
+        if p.ndim == 1:
+            return (-0.5 / self.controlWeight) * p[2:4]
+
+        if p.ndim == 2:
+            return (-0.5 / self.controlWeight) * p[2:4, :]
+
+        raise ValueError(f"p must have shape (4,) or (4,M), got {p.shape}.")
+
+    def getF(self, x, muX):
+        x, vector_input = self._as2d(x)
+
+        out = self.f(x)
+        out = np.asarray(out, dtype=float)
+
+        if out.ndim == 1:
+            out = out.reshape(4, 1)
+
+        u = np.asarray(muX, dtype=float)
+
+        if u.ndim == 1:
+            u = u.reshape(2, 1)
+
+        if u.ndim != 2 or u.shape[0] != 2:
+            raise ValueError(f"Control must have shape (2,) or (2,M), got {u.shape}.")
+
+        if u.shape[1] == 1 and x.shape[1] > 1:
+            u = np.broadcast_to(u, (2, x.shape[1]))
+
+        out[2:4, :] += u
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def getRHS(self, x, muX):
+        """
+        Your code convention:
+            getRHS = -running_cost.
+        """
+        u = np.asarray(muX, dtype=float)
+
+        if u.ndim == 1:
+            usq = np.sum(u * u)
+        elif u.ndim == 2:
+            usq = np.sum(u * u, axis=0)
+        else:
+            raise ValueError(f"Control has invalid shape {u.shape}.")
+
+        return -self.h(x) - self.controlWeight * usq
+
+    def terminalCost(self, x):
+        x, vector_input = self._as2d(x)
+
+        val = np.sum(x * (self.matrixKGain @ x), axis=0)
+
+        if vector_input:
+            return float(val[0])
+
+        return val
+
+    def gradTerminalCost(self, x):
+        x, vector_input = self._as2d(x)
+
+        out = 2.0 * self.matrixKGain @ x
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def jacobi_of_f_transposed_dot_p(self, x, p):
+        x, vector_input = self._as2d(x)
+
+        p = np.asarray(p, dtype=float)
+        if p.ndim == 1:
+            p = p.reshape(4, 1)
+
+        q = x[:2, :]
+
+        H11, H12, H22 = self._hessian_potential_entries(q)
+
+        p_q1 = p[0, :]
+        p_q2 = p[1, :]
+        p_v1 = p[2, :]
+        p_v2 = p[3, :]
+
+        out1 = -H11 * p_v1 - H12 * p_v2
+        out2 = -H12 * p_v1 - H22 * p_v2
+        out3 = p_q1 - self.d1 * p_v1
+        out4 = p_q2 - self.d2 * p_v2
+
+        out = np.vstack([out1, out2, out3, out4])
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def jacobi_of_gu_transposed_dot_p(self, x, u, p):
+        """
+        g is constant, so D_x(g(x)u)^T p = 0.
+        """
+        x, vector_input = self._as2d(x)
+
+        out = np.zeros_like(x)
+
+        if vector_input:
+            return out[:, 0]
+
+        return out
+
+    def HJB(self, x, p):
+        """
+        HJB residual:
+            h(x) - 1/(4R) |g^T p|^2 + f(x)^T p.
+        """
+        x, vector_input = self._as2d(x)
+
+        p = np.asarray(p, dtype=float)
+        if p.ndim == 1:
+            p = p.reshape(4, 1)
+
+        gt_p_sq = np.sum(p[2:4, :] * p[2:4, :], axis=0)
+        f_dot_p = np.sum(self.f(x) * p, axis=0)
+
+        val = self.h(x) - (0.25 / self.controlWeight) * gt_p_sq + f_dot_p
+
+        if vector_input:
+            return float(val[0])
+
+        return val
+
+    def trueVF(self, x):
+        raise NotImplementedError(
+            "No analytic value function is available for CoupledDuffingOscillator4D."
+        )
+
