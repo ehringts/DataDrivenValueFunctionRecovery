@@ -25,7 +25,7 @@ This repository contains experiment scripts and helper modules for RKHS-based su
 
 ## Standard experiment workflow
 
-1. Run `makeAllData()` to generate training, test, and long-horizon data.
+1. Run `makeAllData()` to generate training, test, and long-horizon data. For all model problems, this step can be computationally expensive and may take a long time. The Van der Pol example is comparatively moderate.
 2. Run `doCrossValidationClassic()` and `doCrossValidationControl()` to choose suitable kernel parameters.
 3. Run `computeErrorsClassic()` and `computeErrorsControl()` to train the surrogates and store the error curves.
 4. Run `plotResult()` to load the trained surrogates and create the final plots.
