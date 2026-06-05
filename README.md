@@ -1,6 +1,6 @@
 # Organisation of the repository
 
-This repository contains experiment scripts and helper modules for RKHS-based surrogate construction in optimal control problems.
+This repository contains experiment scripts and helper modules for RKHS-based surrogate construction in optimal control problems. It considers two value-function surrogate constructions: a standard value-based surrogate and a feedback-oriented surrogate based on control-induced linear functional constraints. The experiments evaluate both approximation errors and the closed-loop performance of the corresponding surrogate-induced feedback controls.
 
 ## Experiment scripts
 
