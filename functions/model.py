@@ -249,7 +249,7 @@ class Model(metaclass=abc.ABCMeta):
             dJ = -float(np.asarray(self.getRHS(x, u)).reshape(-1)[0])
             return np.concatenate([dx, [dJ]])
         y0   = np.concatenate([x0, [0.0]])
-        sol  = solve_ivp(rhs, (0.0, float(endT)), y0, method='BDF', rtol=1e-06, atol=1e-06)
+        sol  = solve_ivp(rhs, (0.0, float(endT)), y0, method='DOP853', rtol=1e-10, atol=1e-10)
         xT   = sol.y[:-1, -1]
         cost = sol.y[-1, -1] + self.terminalCost(xT)
         return (sol.y[:-1], sol.t, cost)
